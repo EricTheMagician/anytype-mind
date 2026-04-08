@@ -177,6 +177,8 @@ copy_files_to_repo() {
   # Create .opencode directory structure
   mkdir -p "$TARGET_REPO/.opencode/agents"
   mkdir -p "$TARGET_REPO/.opencode/commands"
+  mkdir -p "$TARGET_REPO/.opencode/plugins"
+  mkdir -p "$TARGET_REPO/.opencode/skills/anytype"
 
   # Copy agents (if they exist)
   if [ -d "$source_repo/.opencode/agents" ]; then
@@ -189,6 +191,15 @@ copy_files_to_repo() {
     echo "   Copying commands..."
     cp -r "$source_repo/.opencode/commands"/* "$TARGET_REPO/.opencode/commands/" 2>/dev/null || true
   fi
+  # Copy plugins (if they exist)
+  if [ -d "$source_repo/.opencode/plugins" ]; then
+    echo "   Copying plugins..."
+    cp -r "$source_repo/.opencode/plugins"/* "$TARGET_REPO/.opencode/plugins/" 2>/dev/null || true
+  fi
+
+  # Copy skills
+  echo "   Copying skills..."
+  cp -r "$source_repo/references" "$source_repo/SKILL.md" "$TARGET_REPO/.opencode/skills/anytype/" 2>/dev/null || true
 
   # Copy opencode.jsonc
   if [ -f "$source_repo/.opencode/opencode.jsonc" ]; then
