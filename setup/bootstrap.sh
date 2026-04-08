@@ -58,20 +58,59 @@ auth_header="Authorization: Bearer $API_KEY"
 version_header="Anytype-Version: $API_VERSION"
 content_type="Content-Type: application/json"
 
+# Temporary file for HTTP response code
+HTTP_CODE_FILE=$(mktemp)
+
 call_api() {
   local method="$1"
   local endpoint="$2"
   local data="${3:-}"
+  local response_body
+  local http_code
+
+  # Clean up previous HTTP code
+  rm -f "$HTTP_CODE_FILE"
 
   if [ -n "$data" ]; then
-    curl -s -X "$method" "${API_BASE}${endpoint}" \
+    response_body=$(curl -s -w "\n%{http_code}" -X "$method" "${API_BASE}${endpoint}" \
       -H "$auth_header" -H "$version_header" -H "$content_type" \
-      -d "$data"
+      -d "$data" 2>&1)
   else
-    curl -s -X "$method" "${API_BASE}${endpoint}" \
-      -H "$auth_header" -H "$version_header"
+    response_body=$(curl -s -w "\n%{http_code}" -X "$method" "${API_BASE}${endpoint}" \
+      -H "$auth_header" -H "$version_header" 2>&1)
+  fi
+
+  # Extract HTTP code (last line) and body (everything else)
+  http_code=$(echo "$response_body" | tail -n1)
+  response_body=$(echo "$response_body" | sed '$d')
+
+  # Store HTTP code for checking
+  echo "$http_code" > "$HTTP_CODE_FILE"
+
+  # Check for non-2xx status codes
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    echo "ERROR: HTTP $http_code calling ${method} ${endpoint}" >&2
+    echo "Request body: ${data:-<none>}" >&2
+    echo "Response: $response_body" >&2
+  fi
+
+  echo "$response_body"
+}
+
+# Helper to check last HTTP status
+get_last_http_code() {
+  if [ -f "$HTTP_CODE_FILE" ]; then
+    cat "$HTTP_CODE_FILE"
+  else
+    echo "unknown"
   fi
 }
+
+# Cleanup HTTP code file on exit
+cleanup() {
+  rm -f "$HTTP_CODE_FILE"
+}
+trap cleanup EXIT
 
 # Read saved space from .space.md
 read_saved_space() {
@@ -200,6 +239,23 @@ for i, s in enumerate(spaces, 1):
 echo "=== Anytype Mind Bootstrap ==="
 echo ""
 echo "Target repo: $TARGET_REPO"
+echo "API Base: $API_BASE"
+echo ""
+
+# Test API connectivity first
+echo ">> Testing API connectivity..."
+TEST_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "${API_BASE}/spaces" -H "$auth_header" -H "$version_header" 2>&1)
+if [[ ! "$TEST_RESPONSE" =~ ^2[0-9][0-9]$ ]]; then
+  echo "ERROR: Cannot connect to Anytype API at $API_BASE"
+  echo "HTTP Status: $TEST_RESPONSE"
+  echo ""
+  echo "Please check:"
+  echo "  1. Anytype desktop app is running"
+  echo "  2. API is enabled in Settings > API Keys"
+  echo "  3. ANYTYPE_API_KEY environment variable is set correctly"
+  exit 1
+fi
+echo "   API connection successful (HTTP $TEST_RESPONSE)"
 echo ""
 
 # 0. Copy files to target repo
@@ -268,12 +324,50 @@ echo ">> Creating properties..."
 
 get_prop_id() { eval echo "\${PROP_ID_$1:-}"; }
 
+# Fetch existing property ID by key
+fetch_property_id() {
+  local key="$1"
+  local properties_json
+  properties_json=$(call_api GET "/spaces/$SPACE_ID/properties")
+  echo "$properties_json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for prop in data.get('data', []):
+    if prop.get('key') == '$key':
+        print(prop.get('id', ''))
+        break
+" 2>/dev/null
+}
+
 create_property() {
   local key="$1" name="$2" format="$3"
   echo "   Creating property: $name ($format)"
   RESULT=$(call_api POST "/spaces/$SPACE_ID/properties" \
     "{\"name\":\"$name\",\"key\":\"$key\",\"format\":\"$format\"}")
-  PROP_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+  HTTP_CODE=$(get_last_http_code)
+
+  if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
+    PROP_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+    if [ -z "$PROP_ID" ]; then
+      echo "   WARNING: Property '$name' created but could not extract ID"
+      echo "   Response: $RESULT"
+    else
+      echo "   ✓ Created property: $name (ID: ${PROP_ID:0:8}...)"
+    fi
+  elif echo "$RESULT" | grep -q "already exists"; then
+    echo "   ⚠ Property '$name' already exists, fetching ID..."
+    PROP_ID=$(fetch_property_id "$key")
+    if [ -n "$PROP_ID" ]; then
+      echo "   ✓ Using existing property: $name (ID: ${PROP_ID:0:8}...)"
+    else
+      echo "   WARNING: Could not fetch ID for existing property '$name'"
+    fi
+  else
+    echo "   FAILED to create property: $name (HTTP $HTTP_CODE)"
+    echo "   Response: $RESULT"
+    return 1
+  fi
+
   eval "PROP_ID_${key}=\$PROP_ID"
   sleep 1
 }
@@ -285,8 +379,8 @@ create_property "ticket" "Ticket" "text"
 create_property "severity" "Severity" "select"
 create_property "incident_role" "Incident Role" "select"
 create_property "review_cycle" "Review Cycle" "select"
-create_property "related_person" "Related Person" "object"
-create_property "related_team" "Related Team" "object"
+create_property "related_person" "Related Person" "objects"
+create_property "related_team" "Related Team" "objects"
 create_property "project_name" "Project" "text"
 create_property "title" "Title" "text"
 
@@ -297,8 +391,19 @@ echo ">> Creating tags for select properties..."
 
 create_tag() {
   local prop_id="$1" tag_name="$2"
-  call_api POST "/spaces/$SPACE_ID/properties/$prop_id/tags" \
-    "{\"name\":\"$tag_name\"}" > /dev/null 2>&1
+  local result
+  result=$(call_api POST "/spaces/$SPACE_ID/properties/$prop_id/tags" \
+    "{\"name\":\"$tag_name\",  \"color\": \"grey\"}")
+  local http_code=$(get_last_http_code)
+
+  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    : # Success, no output needed for tags
+  elif echo "$result" | grep -qi "already exists"; then
+    : # Tag already exists, silently continue
+  else
+    echo "     ERROR creating tag '$tag_name' for property $prop_id (HTTP $http_code)" >&2
+    return 1
+  fi
   sleep 0.5
 }
 
@@ -366,8 +471,19 @@ echo ">> Creating types..."
 create_type() {
   local key="$1" name="$2" icon="$3" layout="$4"
   echo "   Creating type: $name"
-  call_api POST "/spaces/$SPACE_ID/types" \
-    "{\"name\":\"$name\",\"key\":\"$key\",\"icon\":\"$icon\",\"layout\":\"$layout\"}" > /dev/null 2>&1
+  local result
+  result=$(call_api POST "/spaces/$SPACE_ID/types" \
+    "{\"name\":\"$name\", \"plural_name\": \"${name}s\", \"key\":\"$key\",\"icon\": { \"format\": \"icon\", \"name\": \"$icon\", \"color\": \"yellow\"  },\"layout\":\"$layout\"}")
+  local http_code=$(get_last_http_code)
+
+  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    echo "     ✓ Created type: $name"
+  elif echo "$result" | grep -q "already exists"; then
+    echo "     ⚠ Type '$name' already exists"
+  else
+    echo "     ERROR creating type '$name' (HTTP $http_code)" >&2
+    return 1
+  fi
   sleep 1
 }
 
@@ -376,13 +492,13 @@ create_type "incident" "Incident" "warning" "basic"
 create_type "one_on_one" "1:1 Note" "people" "basic"
 create_type "decision" "Decision Record" "scale" "basic"
 create_type "person" "Person" "person" "profile"
-create_type "team" "Team" "group" "basic"
+create_type "team" "Team" "people" "basic"
 create_type "competency" "Competency" "star" "basic"
 create_type "pr_analysis" "PR Analysis" "code" "basic"
 create_type "review_brief" "Review Brief" "document" "basic"
-create_type "brain_note" "Brain Note" "brain" "basic"
+create_type "brain_note" "Brain Note" "book" "basic"
 create_type "brag_entry" "Brag Entry" "trophy" "basic"
-create_type "thinking_note" "Thinking Note" "thought" "basic"
+create_type "thinking_note" "Thinking Note" "bulb" "basic"
 
 echo ""
 
@@ -392,8 +508,19 @@ echo ">> Creating key brain note objects..."
 create_brain_note() {
   local name="$1" desc="$2" body="$3"
   echo "   Creating: $name"
-  call_api POST "/spaces/$SPACE_ID/objects" \
-    "{\"name\":\"$name\",\"type_key\":\"brain_note\",\"description\":\"$desc\",\"body\":\"$body\"}" > /dev/null 2>&1
+  local result
+  result=$(call_api POST "/spaces/$SPACE_ID/objects" \
+    "{\"name\":\"$name\",\"type_key\":\"brain_note\",\"description\":\"$desc\",\"body\":\"$body\"}")
+  local http_code=$(get_last_http_code)
+
+  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    echo "     ✓ Created: $name"
+  elif echo "$result" | grep -qi "already exists"; then
+    echo "     ⚠ Brain note '$name' already exists"
+  else
+    echo "     ERROR creating brain note '$name' (HTTP $http_code)" >&2
+    return 1
+  fi
   sleep 1
 }
 
@@ -412,8 +539,17 @@ echo ">> Creating collections..."
 create_collection() {
   local name="$1" desc="$2"
   echo "   Creating collection: $name"
-  call_api POST "/spaces/$SPACE_ID/objects" \
-    "{\"name\":\"$name\",\"type_key\":\"collection\",\"description\":\"$desc\"}" > /dev/null 2>&1
+  local result
+  result=$(call_api POST "/spaces/$SPACE_ID/objects" \
+    "{\"name\":\"$name\",\"type_key\":\"collection\",\"description\":\"$desc\"}")
+  local http_code=$(get_last_http_code)
+
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    echo "     ERROR creating collection '$name' (HTTP $http_code)" >&2
+    return 1
+  else
+    echo "     ✓ Created collection: $name"
+  fi
   sleep 1
 }
 
