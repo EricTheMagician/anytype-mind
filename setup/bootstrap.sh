@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env nix-shell
+#!nix-shell -i bash -p bash python3 curl
 set -euo pipefail
 
 # Anytype Mind Bootstrap Script
@@ -10,17 +11,44 @@ set -euo pipefail
 #   - Set ANYTYPE_API_KEY environment variable
 #
 # Usage:
-#   ANYTYPE_API_KEY="your-key-here" bash setup/bootstrap.sh
-#   ANYTYPE_API_KEY="your-key-here" bash setup/bootstrap.sh --switch-space
+#   ANYTYPE_API_KEY="your-key-here" bash setup/bootstrap.sh /path/to/target/repo
+#   ANYTYPE_API_KEY="your-key-here" bash setup/bootstrap.sh /path/to/target/repo --switch-space
 #
 # Optional:
 #   ANYTYPE_API_DISABLE_RATE_LIMIT=1 to disable rate limiting during setup
 
-SPACE_FILE=".space.md"
+# Parse arguments
+TARGET_REPO=""
 SWITCH_SPACE=false
-if [ "${1:-}" = "--switch-space" ]; then
-  SWITCH_SPACE=true
+
+for arg in "$@"; do
+  if [ "$arg" = "--switch-space" ]; then
+    SWITCH_SPACE=true
+  elif [ -z "$TARGET_REPO" ]; then
+    TARGET_REPO="$arg"
+  fi
+done
+
+# Validate target repo
+if [ -z "$TARGET_REPO" ]; then
+  echo "Error: Target repo path not specified."
+  echo "Usage: ANYTYPE_API_KEY='your-key' bash setup/bootstrap.sh /path/to/target/repo"
+  exit 1
 fi
+
+if [ ! -d "$TARGET_REPO" ]; then
+  echo "Error: Target repo does not exist: $TARGET_REPO"
+  exit 1
+fi
+
+if [ ! -d "$TARGET_REPO/.git" ]; then
+  echo "Error: Target repo is not a git repository (no .git directory found): $TARGET_REPO"
+  exit 1
+fi
+
+# Convert to absolute path
+TARGET_REPO="$(cd "$TARGET_REPO" && pwd)"
+SPACE_FILE="$TARGET_REPO/.space.md"
 
 API_BASE="http://localhost:31009/v1"
 API_KEY="${ANYTYPE_API_KEY:?Set ANYTYPE_API_KEY environment variable}"
@@ -73,9 +101,66 @@ updated: $(date +%Y-%m-%d)
 This file stores your selected Anytype space for AI tools to use.
 It is gitignored — each machine keeps its own.
 
-To change: \`bash setup/bootstrap.sh --switch-space\`
+To change: \`bash setup/bootstrap.sh /path/to/repo --switch-space\`
 EOF
   echo "   Saved to $SPACE_FILE"
+}
+
+# Append .space.md to .gitignore
+gitignore_add_space_file() {
+  local gitignore="$TARGET_REPO/.gitignore"
+  local entry=".space.md"
+
+  if [ -f "$gitignore" ]; then
+    # Check if entry already exists
+    if grep -qF "$entry" "$gitignore" 2>/dev/null; then
+      echo "   .gitignore already contains: $entry"
+    else
+      echo "" >> "$gitignore"
+      echo "# Anytype Mind - machine-specific space configuration" >> "$gitignore"
+      echo "$entry" >> "$gitignore"
+      echo "   Appended to .gitignore: $entry"
+    fi
+  else
+    echo "# Anytype Mind - machine-specific space configuration" > "$gitignore"
+    echo "$entry" >> "$gitignore"
+    echo "   Created .gitignore with: $entry"
+  fi
+}
+
+# Copy Anytype Mind files to target repo
+copy_files_to_repo() {
+  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local source_repo="$(dirname "$script_dir")"
+
+  echo ">> Copying Anytype Mind files to target repo..."
+
+  # Create .opencode directory structure
+  mkdir -p "$TARGET_REPO/.opencode/agents"
+  mkdir -p "$TARGET_REPO/.opencode/commands"
+
+  # Copy agents (if they exist)
+  if [ -d "$source_repo/.opencode/agents" ]; then
+    echo "   Copying agents..."
+    cp -r "$source_repo/.opencode/agents"/* "$TARGET_REPO/.opencode/agents/" 2>/dev/null || true
+  fi
+
+  # Copy commands (if they exist)
+  if [ -d "$source_repo/.opencode/commands" ]; then
+    echo "   Copying commands..."
+    cp -r "$source_repo/.opencode/commands"/* "$TARGET_REPO/.opencode/commands/" 2>/dev/null || true
+  fi
+
+  # Copy opencode.jsonc
+  if [ -f "$source_repo/.opencode/opencode.jsonc" ]; then
+    echo "   Copying opencode.jsonc..."
+    cp "$source_repo/.opencode/opencode.jsonc" "$TARGET_REPO/.opencode/opencode.jsonc"
+  elif [ -f "$source_repo/opencode.jsonc" ]; then
+    echo "   Copying opencode.jsonc..."
+    cp "$source_repo/opencode.jsonc" "$TARGET_REPO/.opencode/opencode.jsonc"
+  fi
+
+  echo "   Files copied successfully"
 }
 
 # Prompt user to pick a space from a list
@@ -114,8 +199,18 @@ for i, s in enumerate(spaces, 1):
 
 echo "=== Anytype Mind Bootstrap ==="
 echo ""
+echo "Target repo: $TARGET_REPO"
+echo ""
 
-# 1. Resolve space — saved, prompted, or created
+# 0. Copy files to target repo
+copy_files_to_repo
+
+# 1. Add .space.md to .gitignore
+gitignore_add_space_file
+
+echo ""
+
+# 2. Resolve space — saved, prompted, or created
 SAVED_ID=$(read_saved_space)
 SAVED_NAME=$(read_saved_space_name)
 
@@ -168,7 +263,7 @@ fi
 
 echo ""
 
-# 2. Create properties
+# 3. Create properties
 echo ">> Creating properties..."
 
 get_prop_id() { eval echo "\${PROP_ID_$1:-}"; }
@@ -197,7 +292,7 @@ create_property "title" "Title" "text"
 
 echo ""
 
-# 3. Create tags for select/multi_select properties
+# 4. Create tags for select/multi_select properties
 echo ">> Creating tags for select properties..."
 
 create_tag() {
@@ -265,7 +360,7 @@ fi
 
 echo ""
 
-# 4. Create types
+# 5. Create types
 echo ">> Creating types..."
 
 create_type() {
@@ -291,7 +386,7 @@ create_type "thinking_note" "Thinking Note" "thought" "basic"
 
 echo ""
 
-# 5. Create key brain_note objects
+# 6. Create key brain_note objects
 echo ">> Creating key brain note objects..."
 
 create_brain_note() {
@@ -311,7 +406,7 @@ create_brain_note "Skills" "Custom slash commands, workflows, and agent capabili
 
 echo ""
 
-# 6. Create collections
+# 7. Create collections
 echo ">> Creating collections..."
 
 create_collection() {
@@ -338,12 +433,13 @@ echo ""
 echo "=== Bootstrap Complete ==="
 echo ""
 echo "Space: ${SPACE_NAME:-$SPACE_ID} ($SPACE_ID)"
+echo "Target: $TARGET_REPO"
 echo "Saved: $SPACE_FILE"
 echo ""
 echo "Next steps:"
 echo "  1. Verify in Anytype app that types, properties, and collections were created"
-echo "  2. Copy SKILL.md to CLAUDE.md (Claude Code) or AGENTS.md (Codex)"
-echo "  3. Configure MCP server in your AI tool (see setup/anytype-mcp-config.json)"
+echo "  2. Review copied files in $TARGET_REPO/.opencode/"
+echo "  3. Configure MCP server in your AI tool (see $TARGET_REPO/.opencode/opencode.jsonc)"
 echo ""
 echo "To change the default space later:"
-echo "  bash setup/bootstrap.sh --switch-space"
+echo "  bash setup/bootstrap.sh $TARGET_REPO --switch-space"

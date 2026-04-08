@@ -1,3 +1,7 @@
+---
+name: anytype-mind
+description: Keep track of projects
+---
 # Anytype Mind
 
 Personal knowledge base powered by Anytype -- an external brain for work notes, decisions, performance tracking, and AI context.
@@ -32,7 +36,7 @@ See `references/anytype-mcp.md` for full tool patterns.
 
 ## Custom Slash Commands
 
-Defined in `.claude/commands/`. See `references/` for supporting docs.
+Defined in `.opencode/commands/`. See `references/` for supporting docs.
 
 | Command | Purpose |
 |---------|---------|
