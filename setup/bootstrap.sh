@@ -510,6 +510,7 @@ create_type "review_brief" "Review Brief" "document" "basic"
 create_type "brain_note" "Brain Note" "book" "basic"
 create_type "brag_entry" "Brag Entry" "trophy" "basic"
 create_type "thinking_note" "Thinking Note" "bulb" "basic"
+create_type "action" "Action" "caret-forward" "action"
 
 echo ""
 
